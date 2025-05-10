@@ -3,8 +3,12 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
+import bs4
+import httpx
 import pyotp
 from httpx import AsyncClient, Response
+from x_client_transaction import ClientTransaction
+from x_client_transaction.utils import generate_headers, get_ondemand_file_url
 
 from .account import Account
 from .imap import imap_get_email_code, imap_login
@@ -247,6 +251,18 @@ async def next_login_task(ctx: TaskCtx, rep: Response):
 
     return None
 
+async def auto_gen_x_transaction_id() -> str:
+    session = httpx.AsyncClient(headers=generate_headers())
+
+    home_page = await session.get(url="https://x.com")
+    home_page_response = bs4.BeautifulSoup(home_page.content, 'html.parser')
+
+    ondemand_file_url = get_ondemand_file_url(response=home_page_response)
+    ondemand_file = await session.get(url=ondemand_file_url)
+    ondemand_file_response = bs4.BeautifulSoup(ondemand_file.content, 'html.parser')
+
+    ct = ClientTransaction(home_page_response, ondemand_file_response)
+    return ct.generate_transaction_id(method="POST", path="/1.1/onboarding/task.json")
 
 async def login(acc: Account, cfg: LoginConfig | None = None) -> Account:
     log_id = f"{acc.username} - {acc.email}"
@@ -261,6 +277,8 @@ async def login(acc: Account, cfg: LoginConfig | None = None) -> Account:
     async with acc.make_client() as client:
         guest_token = await get_guest_token(client)
         client.headers["x-guest-token"] = guest_token
+        client_transaction_id = await auto_gen_x_transaction_id()
+        client.headers["x-client-transaction-id"] = client_transaction_id
 
         rep = await login_initiate(client)
         ctx = TaskCtx(client, acc, cfg, None, imap)
@@ -269,8 +287,7 @@ async def login(acc: Account, cfg: LoginConfig | None = None) -> Account:
             if not rep:
                 break
 
-        assert "ct0" in client.cookies, "ct0 not in cookies (most likely ip ban)"
-        client.headers["x-csrf-token"] = client.cookies["ct0"]
+        # assert "ct0" in client.cookies, "ct0 not in cookies (most likely ip ban)"
         client.headers["x-twitter-auth-type"] = "OAuth2Session"
 
         acc.active = True
