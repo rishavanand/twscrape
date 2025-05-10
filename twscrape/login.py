@@ -278,6 +278,7 @@ async def login(acc: Account, cfg: LoginConfig | None = None) -> Account:
         guest_token = await get_guest_token(client)
         client.headers["x-guest-token"] = guest_token
         client_transaction_id = await auto_gen_x_transaction_id()
+        print(f"client_transaction_id: {client_transaction_id}")
         client.headers["x-client-transaction-id"] = client_transaction_id
 
         rep = await login_initiate(client)
