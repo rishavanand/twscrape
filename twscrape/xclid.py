@@ -6,9 +6,15 @@ import random
 import re
 import time
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
 import bs4
 import httpx
+from curl_cffi import requests as curl_requests
 from fake_useragent import UserAgent
+
+_executor = ThreadPoolExecutor(max_workers=2)
 
 
 def _make_client() -> httpx.AsyncClient:
@@ -16,7 +22,25 @@ def _make_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(headers=headers, follow_redirects=True)
 
 
+def _sync_get_page(url: str) -> str:
+    """Use curl_cffi to bypass Cloudflare."""
+    session = curl_requests.Session(impersonate="chrome131")
+    rep = session.get(url)
+    rep.raise_for_status()
+    return rep.text
+
+
 async def get_tw_page_text(url: str, clt: httpx.AsyncClient | None = None):
+    # Use curl_cffi to bypass Cloudflare
+    loop = asyncio.get_event_loop()
+    try:
+        text = await loop.run_in_executor(_executor, _sync_get_page, url)
+        if ">document.location =" not in text:
+            return text
+    except Exception:
+        pass
+
+    # Fallback to httpx if curl_cffi fails
     clt = clt or _make_client()
     rep = await clt.get(url)
 
@@ -246,30 +270,32 @@ async def load_keys(soup: bs4.BeautifulSoup) -> tuple[list[int], str]:
 class XClIdGen:
     @staticmethod
     async def create(clt: httpx.AsyncClient | None = None) -> "XClIdGen":
-        text = await get_tw_page_text("https://x.com/tesla", clt=clt)
-        soup = bs4.BeautifulSoup(text, "html.parser")
+        # Use x_client_transaction library with curl_cffi for Cloudflare bypass
+        from x_client_transaction import ClientTransaction
+        from x_client_transaction.utils import get_ondemand_file_url
 
-        vk_bytes, anim_key = await load_keys(soup)
-        clid_gen = XClIdGen(vk_bytes, anim_key)
-        return clid_gen
+        loop = asyncio.get_event_loop()
 
-    def __init__(self, vk_bytes: list[int], anim_key: str):
-        self.vk_bytes = vk_bytes
-        self.anim_key = anim_key
+        def _sync_create():
+            session = curl_requests.Session(impersonate="chrome131")
+            home_page = session.get("https://x.com")
+            home_soup = bs4.BeautifulSoup(home_page.content, "html.parser")
+
+            ondemand_url = get_ondemand_file_url(home_soup)
+            ondemand_page = session.get(ondemand_url)
+            ondemand_soup = bs4.BeautifulSoup(ondemand_page.content, "html.parser")
+
+            ct = ClientTransaction(home_soup, ondemand_soup)
+            return ct
+
+        ct = await loop.run_in_executor(_executor, _sync_create)
+        return XClIdGen(ct)
+
+    def __init__(self, ct):
+        self._ct = ct
 
     def calc(self, method: str, path: str) -> str:
-        ts = math.floor((time.time() * 1000 - 1682924400 * 1000) / 1000)
-        ts_bytes = [(ts >> (i * 8)) & 0xFF for i in range(4)]
-
-        dkw, drn = "obfiowerehiring", 3  # default keyword and random number
-        pld = f"{method.upper()}!{path}!{ts}{dkw}{self.anim_key}"
-        pld = list(hashlib.sha256(pld.encode()).digest())
-        pld = [*self.vk_bytes, *ts_bytes, *pld[:16], drn]
-
-        num = random.randint(0, 255)
-        pld = bytearray([num, *[x ^ num for x in pld]])
-        out = base64.b64encode(pld).decode("utf-8").strip("=")
-        return out
+        return self._ct.generate_transaction_id(method=method, path=path)
 
 
 # MARK: Demo code
